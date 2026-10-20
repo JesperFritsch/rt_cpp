@@ -1,0 +1,30 @@
+# Build output
+build/
+out/
+
+# clangd / IDE caches
+.cache/
+compile_commands.json
+.clangd/
+
+# CMake local overrides (per-developer, not shared)
+CMakeUserPresets.json
+
+# Editor / OS junk
+*.swp
+*~
+.DS_Store
+
+# Sanitizer and profiling output
+*.log
+callgrind.out.*
+perf.data*
+core
+core.*
+
+# Compiled artifacts (in case anything lands outside build/)
+*.o
+*.a
+*.so
+*.gcda
+*.gcno
