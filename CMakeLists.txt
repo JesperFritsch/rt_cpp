@@ -45,11 +45,14 @@ target_compile_options(rt_warnings INTERFACE
 # rt_core - the library. Header-only for now; add sources to src/ as needed
 # and switch INTERFACE to STATIC when the first .cpp appears.
 # --------------------------------------------------------------------------
-add_library(rt_core INTERFACE)
+add_library(rt_core STATIC src/FDTDGrid.cpp)
 
-target_include_directories(rt_core INTERFACE include)
-target_compile_features(rt_core INTERFACE cxx_std_17)
-target_link_libraries(rt_core INTERFACE Threads::Threads)
+target_include_directories(rt_core PUBLIC include)
+target_compile_features(rt_core PUBLIC cxx_std_17)
+target_link_libraries(rt_core
+  PUBLIC Threads::Threads
+  PRIVATE rt_warnings)
+
 
 # --------------------------------------------------------------------------
 if(RT_BUILD_APPS)

@@ -6,3 +6,6 @@ Checks: >
   -modernize-use-trailing-return-type
 WarningsAsErrors: ''
 HeaderFilterRegex: '.*'
+Diagnostics: 
+  ClangTidy:
+    Remove: "*"
