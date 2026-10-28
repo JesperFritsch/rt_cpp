@@ -52,7 +52,10 @@ target_compile_features(rt_core PUBLIC cxx_std_17)
 target_link_libraries(rt_core
   PUBLIC Threads::Threads
   PRIVATE rt_warnings)
+target_compile_options(rt_core PRIVATE $<$<CONFIG:Release>:-march=native>)
 
+find_package(OpenMP REQUIRED)
+target_link_libraries(rt_core PRIVATE OpenMP::OpenMP_CXX)
 
 # --------------------------------------------------------------------------
 if(RT_BUILD_APPS)

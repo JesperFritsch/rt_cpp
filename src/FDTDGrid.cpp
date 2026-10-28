@@ -4,42 +4,39 @@
 
   
 void FDTDGrid::updateH() {
-  for (std::size_t i = 0; i < width; ++i)
-    for (std::size_t j = 0; j < height - 1; ++j)
-      hx[idx(i, j)] -= courant * (ez[idx(i, j + 1)] - ez[idx(i, j)]);
-  for (std::size_t i = 0; i < width - 1; ++i)
-    for (std::size_t j = 0; j < height; ++j)
-      hy[idx(i, j)] += courant * (ez[idx(i + 1, j)] - ez[idx(i, j)]);
-}
-
-void FDTDGrid::applyDamping() {
-  for (std::size_t k = 0; k < width * height; ++k) {
-    ez[k] *= damp[k];
-    hx[k] *= damp[k];
-    hy[k] *= damp[k];
+  #pragma omp parallel for
+  for (std::size_t y = 0; y < height - 1; ++y) {
+    for (std::size_t x = 0; x < width; ++x) {
+      std::size_t b_idx = idx(x, y);
+      hx[b_idx] = (hx[b_idx] - courant * (ez[idx(x, y + 1)] - ez[b_idx])) * damp[b_idx];
+    }
+  }
+  #pragma omp parallel for
+  for (std::size_t y = 0; y < height; ++y) {
+    for (std::size_t x = 0; x < width - 1; ++x) {
+      std::size_t b_idx = idx(x, y);
+      hy[b_idx] = (hy[b_idx] + courant * (ez[idx(x + 1, y)] - ez[b_idx])) * damp[b_idx];
+    }
   }
 }
 
+
 void FDTDGrid::updateE() {
-  for (std::size_t i = 1; i < width - 1; ++i)
-    for (std::size_t j = 1; j < height - 1; ++j) {
-      std::size_t k = idx(i, j);
-      if (pec[k]) {
-        ez[k] = 0.0;
-        continue;
-      }
-      ez[k] += courant * ((hy[k] - hy[idx(i - 1, j)]) -
-                            (hx[k] - hx[idx(i, j - 1)]));
+  #pragma omp parallel for
+  for (std::size_t y = 1; y < height - 1; ++y) {
+    for (std::size_t x = 1; x < width - 1; ++x) {
+      std::size_t k = idx(x, y);
+      ez[k] = ez[k] + ((courant * ((hy[k] - hy[idx(x - 1, y)]) - (hx[k] - hx[idx(x, y - 1)])))) * damp[k] * !pec[k];
     }
+  }
 }
-  
 
 FDTDGrid::FDTDGrid(
   std::size_t width,
   std::size_t height,
   std::size_t border,
-  double courant,
-  double dampening = 1.0
+  float courant,
+  float dampening = 1.0
 )
       : ez(width * height),
         hx(width * height),
@@ -56,7 +53,7 @@ for (std::size_t i = 0; i < width; ++i)
     std::size_t d = std::min({i, j, width - 1 - i, height - 1 - j});
     if (d < border) {
       double x = static_cast<double>(border - d) / static_cast<double>(border);
-      damp[idx(i, j)] = 1.0 - 0.5 * x * x * x;
+      damp[idx(i, j)] = 1.0 - 0.1 * x * x * x;
     }
   }
 } 
@@ -65,5 +62,4 @@ for (std::size_t i = 0; i < width; ++i)
 void FDTDGrid::update() {
   updateH();
   updateE();
-  applyDamping();
 }
