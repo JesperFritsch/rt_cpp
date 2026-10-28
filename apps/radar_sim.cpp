@@ -1,11 +1,16 @@
 #include <rt/FDTDGrid.hpp>
+#include <rt/ring_buffer_spsc.hpp>
+#include <array>
+#include <cassert>
 #include <cstdio>
 #include <cmath>
 #include <raylib.h>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <algorithm>
 #include <string>
+#include <thread>
 
 constexpr uint8_t CF_METAL  = 0x1;
 constexpr uint8_t CF_RX     = 0x2;
@@ -108,12 +113,114 @@ struct Receiver {
   std::vector<float> samples;
 };
 
+template<std::size_t N>
+struct SampleBatch {
+  std::size_t seq;
+  std::array<float, N> samples;
+};
+
+// linear array along x that fires steered pulses on demand
+// `pulse` is the pulse shape with t = 0 at pulse start, only evaluated for t in [0, pulse_len]
+// theta is in radians from broadside; positive steers toward +x
 class PhasedArray {
 public:
-  PhasedArray(std::vector<Source> tx, std::vector<Receiver> rx) : transmitter_(tx), receiver_(rx) {}
+  // copies share state, so a copy kept by RadarSim records into the same samples
+  PhasedArray(std::vector<Cell> cells, SourceFn pulse, double pulse_len, double cell_size,
+              double length_cells, double theta)
+    : state_(std::make_shared<State>()) {
+    auto& s = *state_;
+    s.pulse = std::move(pulse);
+    s.pulse_len = pulse_len;
+    s.cell_size = cell_size;
+    s.length_cells = length_cells;
+    s.theta = theta;
+    s.samples.resize(cells.size());
+    s.cells = std::move(cells);
+  }
+
+  double theta() const { return state_->theta; }
+
+  // element cells, in the same order as samples()
+  std::vector<Cell> const& cells() const { return state_->cells; }
+
+  // ez at each element from the latest step; overwritten every step
+  std::vector<float> const& samples() const { return state_->samples; }
+  std::size_t sample_seq() const { return state_->seq; }
+
+  // copies the latest samples into out; N must equal the number of elements
+  template <std::size_t N>
+  void fill(SampleBatch<N>& out) const {
+    assert(state_->samples.size() == N);
+    out.seq = state_->seq;
+    std::copy_n(state_->samples.begin(), N, out.samples.begin());
+  }
+
+  // called by RadarSim::step for each element
+  void record(std::size_t seq, std::size_t element, float value) {
+    state_->seq = seq;
+    state_->samples[element] = value;
+  }
+
+  // applies to pulses fired from now on; pulses already in flight keep their angle
+  void set_theta(double theta) { state_->theta = theta; }
+
+  // fire a pulse starting at sim time t0, steered at the current theta
+  void fire(double t0) {
+    auto& s = *state_;
+    // drop pulses that have finished on every element
+    double max_delay = s.length_cells * s.cell_size / c0;
+    s.pulses.erase(
+      std::remove_if(s.pulses.begin(), s.pulses.end(),
+                     [&](Pulse const& p) { return t0 > p.t0 + s.pulse_len + max_delay; }),
+      s.pulses.end());
+    s.pulses.push_back({t0, std::sin(s.theta)});
+  }
+
+  // signal for the element `offset_cells` from the array's first element
+  // the fns share state_, so fire and set_theta reach them after they are handed out
+  SourceFn element_fn(double offset_cells) const {
+    return [s = state_, offset_cells](double t) {
+      float sum = 0.0f;
+      for (auto const& p : s->pulses) {
+        // measure from the end that fires first so every delay is >= 0
+        double d = p.sin_theta >= 0.0 ? offset_cells : offset_cells - s->length_cells;
+        double tt = t - p.t0 - d * s->cell_size * p.sin_theta / c0;
+        if (tt >= 0.0 && tt <= s->pulse_len) sum += s->pulse(tt);
+      }
+      return sum;
+    };
+  }
+
 private:
-  std::vector<Source> transmitter_;
-  std::vector<Receiver> receiver_; 
+  struct Pulse {
+    double t0;
+    double sin_theta;  // latched when fired
+  };
+  struct State {
+    SourceFn pulse;
+    double pulse_len;
+    double cell_size;
+    double length_cells;
+    double theta;
+    std::vector<Pulse> pulses;
+    std::vector<Cell> cells;
+    std::size_t seq = 0;
+    std::vector<float> samples;
+  };
+  std::shared_ptr<State> state_;
+};
+
+struct Waveform {
+  double f_start;
+  double f_end;
+  double duration;
+  double amplitude;
+};
+
+struct PulseRequest {
+  std::size_t seq;
+  Waveform wave;
+  double t_time;
 };
 
 class RadarSim {
@@ -125,6 +232,7 @@ private:
   std::size_t step_ = 0;
   std::vector<Source> sources;
   std::vector<Receiver> receivers;
+  std::vector<PhasedArray> arrays;
   std::size_t width, height;
   std::vector<uint8_t> cell_features;
 
@@ -154,6 +262,22 @@ public:
   void create_source(std::vector<Cell> cells, SourceFn fn) {
     for (auto const& cell : cells) cell_features[cell.y * width + cell.x] |= CF_TX;
     sources.push_back({std::move(cells), std::move(fn)});
+  }
+
+  // `n` single-cell elements along x, `spacing` cells apart, starting at `first`
+  // keep spacing <= λ/2 to avoid grating lobes
+  // the array is silent until PhasedArray::fire is called
+  PhasedArray create_phased_array(Cell first, std::size_t n, std::size_t spacing,
+                                  SourceFn pulse, double pulse_len, double theta = 0.0) {
+    auto length = static_cast<double>((n - 1) * spacing);
+    std::vector<Cell> cells;
+    for (std::size_t i = 0; i < n; ++i) cells.push_back({first.x + i * spacing, first.y});
+
+    PhasedArray array(cells, std::move(pulse), pulse_len, cell_size_, length, theta);
+    for (auto const& cell : cells)
+      create_source({cell}, array.element_fn(static_cast<double>(cell.x - first.x)));
+    arrays.push_back(array);
+    return array;
   }
 
   // returns an id to read the samples back with
@@ -199,6 +323,11 @@ public:
     for (auto& rx : receivers) {
       rx.samples.push_back(grid_.get_ez(rx.cell.x, rx.cell.y));
     }
+    for (auto& array : arrays) {
+      auto const& cells = array.cells();
+      for (std::size_t i = 0; i < cells.size(); ++i)
+        array.record(step_, i, grid_.get_ez(cells[i].x, cells[i].y));
+    }
     ++step_;
   }
 
@@ -222,14 +351,29 @@ void print_bar(float value, float max_value, int half_width) {
   std::fflush(stdout);
 }
 
+template<std::size_t RX, std::size_t TX, std::size_t SPL>
+auto processing_worker(
+  std::shared_ptr<rt::SPSCRing<PulseRequest, TX>> tx_buff,
+  std::shared_ptr<rt::SPSCRing<SampleBatch<SPL>, RX>> rx_buff
+) {
+  return [=]() {
+    while ( auto batch = rx_buff->pop_blocking() ) {
+      printf("got some data for seq: %ld", batch.value().seq);
+      (void)tx_buff->push({batch.value().seq, {0.0, 0.0, 0.0, 0.0}, 0.0});
+    }
+  };
+}
+
 int main() {
-  InitWindow(1200, 1200, "radar sim");
+  InitWindow(1000, 1000, "radar sim");
   SetTargetFPS(512);
   constexpr std::size_t grid_size = 1200;
   constexpr std::size_t border = grid_size / 10;
   constexpr int steps_per_frame = 1;
   constexpr double cell_size = 0.01;   // 1 cm per cell
   constexpr double freq = 1.5e9;       // λ = c / f = 20 cm = 20 cells
+  constexpr std::size_t rx_buff_size = 128;
+  constexpr std::size_t tx_buff_size = 128;
 
   auto radar_sim = RadarSim(grid_size, grid_size, border, cell_size);
   auto const& ez_grid = radar_sim.grid();
@@ -244,17 +388,23 @@ int main() {
   Texture2D ez_tex = LoadTextureFromImage(ez_img);
 
   // antenna just inside the sponge border
-  radar_sim.create_source(
-    line(grid_size / 2 - 50, grid_size - 200, grid_size / 2 + 50, grid_size - 200),
-    burst(freq, 3, 2.0)
+  // 21 elements at λ/4 spacing, pulse is 3 cycles; SPACE fires, LEFT/RIGHT steer
+  constexpr std::size_t n_elements = 21;
+  constexpr std::size_t spacing = 5;
+  constexpr int pulse_cycles = 3;
+  auto array = radar_sim.create_phased_array(
+    {grid_size / 2 - (n_elements - 1) * spacing / 2, grid_size - 200},
+    n_elements, spacing, burst(freq, pulse_cycles, 2.0), pulse_cycles / freq
   );
+  constexpr double theta_step = 5.0 * pi / 180.0;
 
-  auto rx = radar_sim.create_receiver({grid_size / 2, border + 10});
+  auto tx_buff = std::make_shared<rt::SPSCRing<PulseRequest, tx_buff_size>>();
+  auto rx_buff = std::make_shared<rt::SPSCRing<SampleBatch<n_elements>, rx_buff_size>>();
 
   // targets: a round object and a flat plate
   radar_sim.add_metal(disk(grid_size / 4, grid_size / 4, 30));
-  radar_sim.add_metal(line(3 * grid_size / 4, grid_size / 4, 3 * grid_size / 4 + 4, grid_size / 2));
-  radar_sim.add_metal(line(grid_size / 2 - 50, 200, grid_size / 2 + 50, 200));
+  // radar_sim.add_metal(line(3 * grid_size / 4, grid_size / 4, 3 * grid_size / 4 + 4, grid_size / 2));
+  // radar_sim.add_metal(line(grid_size / 2 - 50, 199, grid_size / 2 + 50, 200));
 
   // metal is uploaded once; re-upload pec_bytes with UpdateTexture if it changes
   auto const& features = radar_sim.get_cell_features();
@@ -274,10 +424,17 @@ int main() {
   float gain = static_cast<float>(visual_gain);
   SetShaderValue(shader, gain_loc, &gain, SHADER_UNIFORM_FLOAT);
 
+  auto worker_t = std::thread(processing_worker(tx_buff, rx_buff));
+
   while (!WindowShouldClose()) {
+    if (IsKeyPressed(KEY_LEFT)) array.set_theta(array.theta() - theta_step);
+    if (IsKeyPressed(KEY_RIGHT)) array.set_theta(array.theta() + theta_step);
+    if (IsKeyPressed(KEY_SPACE)) array.fire(radar_sim.time());
     double start_time = GetTime();
     for (int s = 0; s < steps_per_frame; ++s) radar_sim.step();
-    print_bar(radar_sim.samples(rx).back(), 1.0, 150);
+    SampleBatch<n_elements> batch;
+    array.fill(batch);
+    (void)rx_buff->emplace(std::move(batch));
     double work_time = GetTime() - start_time;
     UpdateTexture(ez_tex, ez_grid.data());
     BeginDrawing();
@@ -291,10 +448,11 @@ int main() {
     DrawText(TextFormat("work %4.2f ms  idle %4.2f ms  fps %d", work_time * 1000.0, (GetFrameTime() - work_time) * 1000.0, GetFPS()), 10, 10, 20, WHITE);
     EndDrawing();
   }
+  rx_buff->close();
+  worker_t.join();
   UnloadShader(shader);
   UnloadTexture(cf_tex);
   UnloadTexture(ez_tex);
   CloseWindow();
-  std::printf("closed, %zu samples recorded at dt = %g s\n",
-              radar_sim.samples(rx).size(), radar_sim.dt());
+  std::printf("closed, samples recorded at dt = %g s\n", radar_sim.dt());
 }
