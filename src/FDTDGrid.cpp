@@ -2,20 +2,20 @@
 #include <cstdio>
 #include <algorithm>
 
-  
+
 void FDTDGrid::updateH() {
   #pragma omp parallel for
-  for (std::size_t y = 0; y < height - 1; ++y) {
-    for (std::size_t x = 0; x < width; ++x) {
-      std::size_t b_idx = idx(x, y);
-      hx[b_idx] = (hx[b_idx] - courant * (ez[idx(x, y + 1)] - ez[b_idx])) * damp[b_idx];
+  for (std::size_t y = 0; y < height_ - 1; ++y) {
+    for (std::size_t x = 0; x < width_; ++x) {
+      std::size_t cell = idx(x, y);
+      hx_[cell] = (hx_[cell] - courant_ * (ez_[idx(x, y + 1)] - ez_[cell])) * damp_[cell];
     }
   }
   #pragma omp parallel for
-  for (std::size_t y = 0; y < height; ++y) {
-    for (std::size_t x = 0; x < width - 1; ++x) {
-      std::size_t b_idx = idx(x, y);
-      hy[b_idx] = (hy[b_idx] + courant * (ez[idx(x + 1, y)] - ez[b_idx])) * damp[b_idx];
+  for (std::size_t y = 0; y < height_; ++y) {
+    for (std::size_t x = 0; x < width_ - 1; ++x) {
+      std::size_t cell = idx(x, y);
+      hy_[cell] = (hy_[cell] + courant_ * (ez_[idx(x + 1, y)] - ez_[cell])) * damp_[cell];
     }
   }
 }
@@ -23,10 +23,10 @@ void FDTDGrid::updateH() {
 
 void FDTDGrid::updateE() {
   #pragma omp parallel for
-  for (std::size_t y = 1; y < height - 1; ++y) {
-    for (std::size_t x = 1; x < width - 1; ++x) {
-      std::size_t k = idx(x, y);
-      ez[k] = ez[k] + ((courant * ((hy[k] - hy[idx(x - 1, y)]) - (hx[k] - hx[idx(x, y - 1)])))) * damp[k] * !pec[k];
+  for (std::size_t y = 1; y < height_ - 1; ++y) {
+    for (std::size_t x = 1; x < width_ - 1; ++x) {
+      std::size_t cell = idx(x, y);
+      ez_[cell] = ez_[cell] + ((courant_ * ((hy_[cell] - hy_[idx(x - 1, y)]) - (hx_[cell] - hx_[idx(x, y - 1)])))) * damp_[cell] * !pec_[cell];
     }
   }
 }
@@ -38,25 +38,26 @@ FDTDGrid::FDTDGrid(
   float courant,
   float dampening = 1.0
 )
-      : ez(width * height),
-        hx(width * height),
-        hy(width * height),
-        damp(width * height, dampening),
-        pec(width * height, 0),
-        width(width),
-        height(height),
-        border(border),
-        courant(courant){
+      : ez_(width * height),
+        hx_(width * height),
+        hy_(width * height),
+        damp_(width * height, dampening),
+        pec_(width * height, 0),
+        width_(width),
+        height_(height),
+        border_(border),
+        courant_(courant){
 // sponge: fields are slightly attenuated each step near the edges
-for (std::size_t i = 0; i < width; ++i)
-  for (std::size_t j = 0; j < height; ++j) {
-    std::size_t d = std::min({i, j, width - 1 - i, height - 1 - j});
-    if (d < border) {
-      double x = static_cast<double>(border - d) / static_cast<double>(border);
-      damp[idx(i, j)] = 1.0 - 0.1 * x * x * x;
+for (std::size_t x = 0; x < width; ++x)
+  for (std::size_t y = 0; y < height; ++y) {
+    std::size_t dist_to_edge = std::min({x, y, width - 1 - x, height - 1 - y});
+    if (dist_to_edge < border) {
+      // 0 at the inner edge of the sponge, 1 at the grid edge
+      float depth = static_cast<float>(border - dist_to_edge) / static_cast<float>(border);
+      damp_[idx(x, y)] = 1.0f - 0.1f * depth * depth * depth;
     }
   }
-} 
+}
 
 
 void FDTDGrid::update() {

@@ -70,7 +70,7 @@ std::pair<double, double> bucket_range(std::size_t bucket, double t_ns) {
 }
 
 std::uint64_t ptile(std::vector<std::uint64_t>& samples, double ptile) {
-  auto idx = std::min(samples.size(), static_cast<std::size_t>(samples.size() * ptile));
+  auto idx = std::min(samples.size(), static_cast<std::size_t>(static_cast<double>(samples.size()) * ptile));
   return samples[idx];
 }
 
