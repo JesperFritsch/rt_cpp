@@ -85,6 +85,48 @@ struct SampleBatch {
   std::array<float, N_ELEMENTS> samples;
 };
 
+struct Position { double x, y; };  // meters
+
+// what the processor knows about the sim, all in meters and seconds
+struct Geometry {
+  double cell_size;                // m per cell
+  double dt;                       // s per step
+  double domain_width;             // m
+  double domain_height;            // m
+  double array_length;             // m, first to last element
+  std::vector<Position> elements;  // same order as SampleBatch::samples
+};
+
+struct RadarConfig {
+  // chosen
+  double f_start = 1.2e9;
+  double f_end = 1.8e9;
+  double pulse_duration = 10e-9;
+  double amplitude = 2.0;
+  double max_scan_angle_r = 60.0 * pi / 180.0;  // radians from broadside
+  double pri_margin = 1.0;                     // < 1 trims the conservative listen time
+
+  // derived
+  double bandwidth() const          { return f_end - f_start; }
+  double blind_range() const        { return speed_of_light * pulse_duration / 2.0; }
+  double range_resolution() const   { return speed_of_light / (2.0 * bandwidth()); }
+  double pulse_length_m() const     { return speed_of_light * pulse_duration; }
+  Waveform waveform() const         { return {f_start, f_end, pulse_duration, amplitude}; }
+
+  // upper bound on the time from fire_time until the last echo has arrived:
+  // out and back are each at most one domain diagonal, steering delays the
+  // last element by up to array_length * sin(max_scan_angle_r), plus the pulse itself
+  double listen_time(Geometry const& geometry) const {
+    double diagonal = std::hypot(geometry.domain_width, geometry.domain_height);
+    double steer_extra = geometry.array_length * std::sin(max_scan_angle_r);
+    return (2.0 * diagonal + steer_extra) / speed_of_light + pulse_duration;
+  }
+
+  std::size_t pri_steps(Geometry const& geometry) const {
+    return static_cast<std::size_t>(std::ceil(listen_time(geometry) * pri_margin / geometry.dt));
+  }
+};
+
 // all cells in the rectangle (x0, y0) - (x1, y1), inclusive; a line if x0 == x1 or y0 == y1
 std::vector<Cell> line(std::size_t x0, std::size_t y0, std::size_t x1, std::size_t y1) {
   std::vector<Cell> out;
@@ -136,9 +178,12 @@ SourceFn burst(double freq_hz, int cycles, double amplitude = 1.0) {
   return [=](double t) { return t < duration ? amplitude * std::sin(2.0 * pi * freq_hz * t) : 0.0; };
 }
 
+// linear chirp from f_start to f_end; the phase is the accumulated frequency,
+// so it grows as f_start * t + 0.5 * chirp_rate * t^2 rather than f(t) * t
 float wave_contrib(double time_in_pulse, Waveform const& wave) {
-  double freq_hz = wave.f_start + (wave.f_end - wave.f_start) * (time_in_pulse / wave.duration);
-  auto contrib =  time_in_pulse < wave.duration ? wave.amplitude * std::sin(2.0 * pi * freq_hz * time_in_pulse) : 0.0;
+  double chirp_rate = (wave.f_end - wave.f_start) / wave.duration;  // Hz per second
+  double cycles = wave.f_start * time_in_pulse + 0.5 * chirp_rate * time_in_pulse * time_in_pulse;
+  auto contrib = time_in_pulse < wave.duration ? wave.amplitude * std::sin(2.0 * pi * cycles) : 0.0;
   return static_cast<float>(contrib);
 }
 
@@ -285,14 +330,21 @@ public:
   // `n_elements` single-cell elements along x, `spacing` cells apart, starting at `first`
   // keep spacing <= λ/2 to avoid grating lobes
   // the array is silent until PhasedArray::fire is called
-  PhasedArray create_phased_array(Cell first, std::size_t n_elements, std::size_t spacing, double theta = 0.0) {
+  PhasedArray create_phased_array(Cell first, std::size_t n_elements, std::size_t spacing, bool x_plane = false, double theta = 0.0) {
     auto length_cells = static_cast<double>((n_elements - 1) * spacing);
     std::vector<Cell> cells;
-    for (std::size_t i = 0; i < n_elements; ++i) cells.push_back({first.x + i * spacing, first.y});
-
+    for (std::size_t i = 0; i < n_elements; ++i) {
+      if (x_plane) {
+        cells.push_back({first.x + i * spacing, first.y});
+      } else {
+        cells.push_back({first.x, first.y + i * spacing});
+      }
+    }
     PhasedArray array(cells, cell_size_, length_cells, theta);
-    for (auto const& cell : cells)
-      create_source({cell}, array.element_fn(static_cast<double>(cell.x - first.x)));
+    for (auto const& cell : cells) {
+        auto cell_offset = x_plane ? cell.x - first.x : cell.y - first.y;
+        create_source({cell}, array.element_fn(static_cast<double>(cell_offset)));
+    }
     arrays.push_back(array);
     return array;
   }
@@ -351,34 +403,92 @@ public:
 
 };
 
+class PulseScheduler {
+public:
+  PulseScheduler(std::size_t pri_steps, double dt, Waveform waveform) :
+    pri_steps_(pri_steps),
+    dt_(dt),
+    wave_(waveform)
+  {
+
+  }
+
+  std::optional<PulseRequest> on_step(std::size_t step) {
+    if( step >= next_pulse_step_ ) {
+      next_pulse_step_ = step + pri_steps_;
+      next_theta_ += theta_stride_;
+      if (next_theta_ >= abs_theta_) {
+        next_theta_ = -abs_theta_;
+      }
+      return PulseRequest{
+        step,
+        wave_,
+        next_theta_,
+        next_pulse_step_ * dt_,
+      };
+    }
+    return {};
+  }
+
+  void set_angles(double abs_angle_r, double ang_stride_r) {
+    abs_theta_ = abs_angle_r;
+    theta_stride_ = ang_stride_r;
+  } 
+
+private:
+  double theta_stride_;
+  double abs_theta_;
+  std::size_t pri_steps_;
+  double dt_;
+  Waveform wave_;
+  std::size_t next_pulse_step_ = 0;
+  double next_theta_ = 0.0;
+};
+
 // runs on the worker thread: takes sample batches from the sim and answers with pulse requests
 template<std::size_t SAMPLE_RING_SIZE, std::size_t REQUEST_RING_SIZE, std::size_t N_ELEMENTS>
 class RadarProcessor {
 public:
   RadarProcessor(rt::SPSCRing<PulseRequest, REQUEST_RING_SIZE>& pulse_requests,
                  rt::SPSCRing<SampleBatch<N_ELEMENTS>, SAMPLE_RING_SIZE>& sample_batches,
-                 double dt)
-    : pulse_requests_(pulse_requests), 
+                 RadarConfig config,
+                 Geometry geometry)
+    : pulse_requests_(pulse_requests),
       sample_batches_(sample_batches),
-      dt_(dt){}
-
-  void run() {
-    auto last_time = std::chrono::steady_clock::now();
-    while ( auto batch = sample_batches_.pop_blocking() ) handle(*batch, last_time);
+      config_(config),
+      geometry_(std::move(geometry)),
+      dt_(geometry_.dt),
+      pri_steps_(config_.pri_steps(geometry_)),
+      scheduler_(pri_steps_, dt_, config_.waveform())
+  {
+    assert(geometry_.elements.size() == N_ELEMENTS);
+    prev_requests_.reserve(max_requests_);
+    scheduler_.set_angles(config_.max_scan_angle_r, config_.max_scan_angle_r / 10.0);
   }
 
-  void handle(SampleBatch<N_ELEMENTS> const& batch, std::chrono::steady_clock::time_point& time) {
-    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - time).count() > 1.0) {
-      std::fflush(stdout);
-      (void)pulse_requests_.push({batch.step, {1.2e9, 1.8e9, 6 / (1.2e9 + 1.8e9), 2.0}, 0.0, (batch.step + 5) * dt_});
-      time = std::chrono::steady_clock::now();
+  std::size_t pri_steps() const { return pri_steps_; }
+
+  void run() {
+    while ( auto batch = sample_batches_.pop_blocking() ) handle(*batch);
+  }
+
+  void handle(SampleBatch<N_ELEMENTS> const& batch) {
+    if (auto req = scheduler_.on_step(batch.step)) {
+      while (!pulse_requests_.push(*req)) {}
     }
+    prev_requests_.clear();
   }
 
 private:
   rt::SPSCRing<PulseRequest, REQUEST_RING_SIZE>& pulse_requests_;           // to the sim
   rt::SPSCRing<SampleBatch<N_ELEMENTS>, SAMPLE_RING_SIZE>& sample_batches_; // from the sim
+  std::vector<PulseRequest> prev_requests_;
+  std::size_t max_requests_ = 10;
+  RadarConfig config_;
+  Geometry geometry_;
   double dt_;
+  std::size_t pri_steps_;
+  PulseScheduler scheduler_;
 };
 
 // prints a bar from a center line: left for negative, right for positive
@@ -401,49 +511,64 @@ void print_bar(float value, float max_value, int half_width) {
 
 
 int main() {
-  InitWindow(1000, 1000, "radar sim");
+  // λ = 20 cells at 1.5 GHz with 1 cm cells, so the grid is 50 x 35 wavelengths
+  constexpr std::size_t grid_width = 1000;
+  constexpr std::size_t grid_height = 700;
+  constexpr std::size_t border = 60;  // sponge, 3λ thick
+  // window has the grid's aspect ratio so cells stay square
+  constexpr int window_width = 1600;
+  constexpr int window_height = static_cast<int>(window_width * grid_height / grid_width);
+  InitWindow(window_width, window_height, "radar sim");
   SetTargetFPS(512);
-  constexpr std::size_t grid_size = 1200;
-  constexpr std::size_t border = grid_size / 10;
-  constexpr int steps_per_frame = 1;
+  constexpr int steps_per_frame = 10;
   constexpr double cell_size = 0.01;   // 1 cm per cell
   constexpr std::size_t sample_ring_size = 128;
   constexpr std::size_t request_ring_size = 128;
 
-  auto radar_sim = RadarSim(grid_size, grid_size, border, cell_size);
+  auto radar_sim = RadarSim(grid_width, grid_height, border, cell_size);
   auto const& ez_grid = radar_sim.grid();
   // raylib only reads from image data, so the const_cast is safe
   Image ez_img = {
     const_cast<float*>(ez_grid.data()),
-    grid_size,
-    grid_size,
+    grid_width,
+    grid_height,
     1,
     PIXELFORMAT_UNCOMPRESSED_R32
   };
   Texture2D ez_tex = LoadTextureFromImage(ez_img);
 
-  // 21 elements at λ/4 spacing, pulse is 3 cycles; SPACE fires, LEFT/RIGHT steer
-  constexpr std::size_t n_elements = 21;
-  constexpr std::size_t spacing = 5;
+  // vertical array of 16 elements at λ/2 spacing, 2λ in from the sponge, facing +x
+  constexpr std::size_t n_elements = 16;
+  constexpr std::size_t spacing = 10;
+  constexpr std::size_t array_start_x = border + 40;
+  constexpr std::size_t array_start_y = grid_height / 2 - (n_elements - 1) * spacing / 2;
+  // ground plane λ/4 behind the elements, extending 1λ past each end of the array
+  constexpr std::size_t plane_distance = 5;
+  constexpr std::size_t plane_margin = 20;
+  radar_sim.add_metal(line(array_start_x - plane_distance - 1, array_start_y - plane_margin,
+                           array_start_x - plane_distance, array_start_y + (n_elements - 1) * spacing + plane_margin));
+
+  // target
+  radar_sim.add_metal(disk(grid_width * 3 / 4, grid_height * 3 / 4, 30));
+
   auto array = radar_sim.create_phased_array(
-    {grid_size / 2 - (n_elements - 1) * spacing / 2, grid_size - 200},
+    {array_start_x, array_start_y },
     n_elements, 
-    spacing
+    spacing,
+    false
   );
 
   rt::SPSCRing<PulseRequest, request_ring_size> pulse_requests;
   rt::SPSCRing<SampleBatch<n_elements>, sample_ring_size> sample_batches;
 
-  // targets: a round object and a flat plate
-  radar_sim.add_metal(disk(grid_size / 4, grid_size / 4, 30));
 
   // features are uploaded once; re-upload feature_bytes with UpdateTexture if they change
   auto const& features = radar_sim.get_cell_features();
   std::vector<unsigned char> feature_bytes(features.begin(), features.end());
   Image features_img = {
     feature_bytes.data(),
-    grid_size,
-    grid_size,
+    grid_width,
+    grid_height,
     1,
     PIXELFORMAT_UNCOMPRESSED_GRAYSCALE
   };
@@ -455,7 +580,22 @@ int main() {
   float gain = static_cast<float>(visual_gain);
   SetShaderValue(shader, gain_loc, &gain, SHADER_UNIFORM_FLOAT);
 
-  RadarProcessor processor(pulse_requests, sample_batches, radar_sim.dt());
+  Geometry geometry{
+    cell_size,
+    radar_sim.dt(),
+    static_cast<double>(grid_width) * cell_size,
+    static_cast<double>(grid_height) * cell_size,
+    static_cast<double>((n_elements - 1) * spacing) * cell_size,
+    {}
+  };
+  for (auto const& cell : array.cells())
+    geometry.elements.push_back({static_cast<double>(cell.x) * cell_size, static_cast<double>(cell.y) * cell_size});
+
+  RadarConfig config;
+  RadarProcessor processor(pulse_requests, sample_batches, config, geometry);
+  std::printf("PRI %zu steps (%.1f ns), blind range %.2f m, range resolution %.2f m\n",
+              processor.pri_steps(), static_cast<double>(processor.pri_steps()) * radar_sim.dt() * 1e9,
+              config.blind_range(), config.range_resolution());
   auto worker_thread = std::thread([&]() { processor.run(); });
 
   while (!WindowShouldClose()) {
@@ -464,10 +604,11 @@ int main() {
       radar_sim.step();
       SampleBatch<n_elements> batch;
       array.fill(batch);
-      (void)sample_batches.emplace(std::move(batch));
-    }
-    while (auto request = pulse_requests.pop()) {
-      array.fire(*request);
+      // make sure that no batches are dropped and lost
+      while(!sample_batches.push(batch)) {};
+      while (auto request = pulse_requests.pop()) {
+        array.fire(*request);
+      }
     }
     double work_time = GetTime() - start_time;
     UpdateTexture(ez_tex, ez_grid.data());
@@ -475,7 +616,7 @@ int main() {
     BeginShaderMode(shader);
     SetShaderValueTexture(shader, features_loc, features_tex);  // must be inside BeginShaderMode
     DrawTexturePro(ez_tex,
-      {0, 0, static_cast<float>(grid_size), static_cast<float>(grid_size)},
+      {0, 0, static_cast<float>(grid_width), static_cast<float>(grid_height)},
       {0, 0, static_cast<float>(GetScreenWidth()), static_cast<float>(GetScreenHeight())},
       {0, 0}, 0.0f, WHITE);
     EndShaderMode();
