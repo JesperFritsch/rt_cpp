@@ -34,8 +34,11 @@ public:
 
   float get_ez(std::size_t x, std::size_t y) const { return ez_[y * width_ + x]; }
 
+  // updateE only stops updating ez in metal, so it must be zero there already;
+  // a nonzero ez frozen in metal would drive the h fields around it up forever
   void set_pec(std::size_t x, std::size_t y, bool metal) {
     pec_[y * width_ + x] = metal ? 1 : 0;
+    if (metal) ez_[y * width_ + x] = 0.0f;
   }
  
   void update(); 
