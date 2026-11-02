@@ -1,10 +1,12 @@
-#include <rt/FDTDGrid.hpp>
+#include <rt/cpu_backend.hpp>
+#include <rt/gpu_backend.hpp>
 #include <rt/ring_buffer_spsc.hpp>
 #include <array>
 #include <cassert>
 #include <cstdio>
 #include <cmath>
 #include <raylib.h>
+#include <rlgl.h>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -22,12 +24,15 @@ constexpr double visual_gain = 5.0;
 constexpr double pi = 3.14159265358979323846;
 constexpr double speed_of_light = 299'792'458.0;  // m/s
 
-// colors the ez texture: red for positive, blue for negative, gray for metal
+// colors ez: red for positive, blue for negative, gray for metal
+// ez is read from a shader storage buffer, so a backend that keeps it on the GPU needs no upload;
+// the quad is drawn with a 1x1 texture only to get fragTexCoord from 0 to 1 across the window
 constexpr const char* field_shader = R"(
-#version 330
+#version 430
 in vec2 fragTexCoord;
 out vec4 finalColor;
-uniform sampler2D texture0;     // ez, single float channel
+layout(std430, binding = 0) readonly buffer Ez { float ez[]; };  // grid_size.x * grid_size.y, row-major
+uniform ivec2 grid_size;
 uniform sampler2D features_tex; // FEATURE_* bits: 0x1 = metal, 0x2 = receiver, 0x4 = transmitter
 uniform float gain;
 void main() {
@@ -44,15 +49,14 @@ void main() {
     finalColor = vec4(0.02, 0.87, 0.98, 1.0);
     return;
   }
-  float field = clamp(texture(texture0, fragTexCoord).r * gain, -1.0, 1.0);
+  ivec2 cell = min(ivec2(fragTexCoord * vec2(grid_size)), grid_size - 1);
+  float field = clamp(ez[cell.y * grid_size.x + cell.x] * gain, -1.0, 1.0);
   finalColor = vec4(max(field, 0.0), 0.0, max(-field, 0.0), 1.0);
 }
 )";
 
 // source signal as a function of simulation time in seconds
 using SourceFn = std::function<float(double)>;
-
-struct Cell { std::size_t x, y; };
 
 struct Waveform {
   double f_start;
@@ -157,8 +161,8 @@ struct RadarConfig {
   double track_gate = 1.0;                     // m, a track only takes plots this close to its prediction
   double track_alpha = 0.5;                    // share of the position error a track corrects per plot
   double track_beta = 0.3;                     // share of the error, per time since the last plot, added to velocity
-  std::size_t confirm_hits = 3;                // plots before a track is confirmed
-  std::size_t max_misses = 3;                  // scans without a plot before a track is dropped
+  std::size_t confirm_hits = 1;                // plots before a track is confirmed
+  std::size_t max_misses = 1;                  // scans without a plot before a track is dropped
   std::size_t track_interval = 2;              // with confirmed tracks, every track_interval-th pulse is a
                                                // Track pulse; 2 alternates, 0 turns track pulses off
   bool simultaneous_tracks = true;             // fire a Track pulse together with every Search pulse instead,
@@ -262,39 +266,20 @@ float wave_contrib(double time_in_pulse, Waveform const& wave, double phase = 0.
 // theta is in radians from broadside; positive steers toward +x
 class PhasedArray {
 public:
-  // copies share state, so a copy kept by RadarSim records into the same samples
+  // copies share state, so fire on the copy returned to the caller reaches the copy kept by RadarSim
   PhasedArray(std::vector<Cell> cells, double cell_size, double length_cells, double theta)
     : state_(std::make_shared<State>()) {
     auto& state = *state_;
     state.cell_size = cell_size;
     state.length_cells = length_cells;
     state.theta = theta;
-    state.samples.resize(cells.size());
     state.cells = std::move(cells);
   }
 
   double theta() const { return state_->theta; }
 
-  // element cells, in the same order as samples()
+  // element cells, in the order RadarSim::array_samples returns their samples
   std::vector<Cell> const& cells() const { return state_->cells; }
-
-  // ez at each element from the latest step; overwritten every step
-  std::vector<float> const& samples() const { return state_->samples; }
-  std::size_t sample_step() const { return state_->sample_step; }
-
-  // copies the latest samples into out; N_ELEMENTS must equal the number of elements
-  template <std::size_t N_ELEMENTS>
-  void fill(SampleBatch<N_ELEMENTS>& out) const {
-    assert(state_->samples.size() == N_ELEMENTS);
-    out.step = state_->sample_step;
-    std::copy_n(state_->samples.begin(), N_ELEMENTS, out.samples.begin());
-  }
-
-  // called by RadarSim::step for each element
-  void record(std::size_t step, std::size_t element, float value) {
-    state_->sample_step = step;
-    state_->samples[element] = value;
-  }
 
   // applies to pulses fired from now on; pulses already in flight keep their angle
   void set_theta(double theta) { state_->theta = theta; }
@@ -349,8 +334,6 @@ private:
     double theta;
     std::vector<Pulse> pulses;  // fired pulses that may still be playing on some element
     std::vector<Cell> cells;
-    std::size_t sample_step = 0;  // step the current samples were taken at
-    std::vector<float> samples;
   };
   std::shared_ptr<State> state_;
 };
@@ -359,7 +342,7 @@ private:
 class RadarSim {
 
 private:
-  FDTDGrid grid_;
+  std::unique_ptr<FdtdBackend> backend_;
   double cell_size_;  // meters per cell
   double dt_;         // seconds per step
   std::size_t step_ = 0;
@@ -369,18 +352,50 @@ private:
   std::size_t width_, height_;
   std::vector<uint8_t> cell_features;  // FEATURE_* bits per cell
 
+  // the backend's source and probe cells are rebuilt before the next batch when this is set
+  bool layout_dirty_ = true;
+  std::vector<std::size_t> array_probe_offsets_;  // first probe of each array; arrays come first
+  std::size_t receiver_probe_offset_ = 0;         // first probe of the receivers, after the arrays
+  std::vector<float> source_values_;              // batch x source cells
+  std::vector<float> probe_rows_;                 // batch x probe cells, from the latest batch
+  std::size_t batch_size_ = 0;                    // steps in the latest batch
+
+  void rebuild_layout() {
+    std::vector<Cell> source_cells;
+    for (auto const& source : sources)
+      source_cells.insert(source_cells.end(), source.cells.begin(), source.cells.end());
+    backend_->set_source_cells(std::move(source_cells));
+
+    std::vector<Cell> probe_cells;
+    array_probe_offsets_.clear();
+    for (auto const& array : arrays) {
+      array_probe_offsets_.push_back(probe_cells.size());
+      probe_cells.insert(probe_cells.end(), array.cells().begin(), array.cells().end());
+    }
+    receiver_probe_offset_ = probe_cells.size();
+    for (auto const& receiver : receivers) probe_cells.push_back(receiver.cell);
+    backend_->set_probe_cells(std::move(probe_cells));
+    layout_dirty_ = false;
+  }
+
 public:
 
+  enum class Backend { Cpu, Gpu };
+
   // dt follows from cell_size and courant: dt = courant * cell_size / c
+  // the GPU backend needs the OpenGL context, so construct after InitWindow
   RadarSim(
     std::size_t width,
     std::size_t height,
     std::size_t border,
+    Backend backend,
     double cell_size = 0.01,
     float courant = 0.5,
     float damp = 1.0
   ) :
-    grid_(width, height, border, courant, damp),
+    backend_(backend == Backend::Gpu
+               ? std::unique_ptr<FdtdBackend>(std::make_unique<GpuBackend>(width, height, border, courant, damp))
+               : std::unique_ptr<FdtdBackend>(std::make_unique<CpuBackend>(width, height, border, courant, damp))),
     cell_size_(cell_size),
     dt_(courant * cell_size / speed_of_light),
     width_(width),
@@ -395,6 +410,7 @@ public:
   void create_source(std::vector<Cell> cells, SourceFn fn) {
     for (auto const& cell : cells) cell_features[cell.y * width_ + cell.x] |= FEATURE_TX;
     sources.push_back({std::move(cells), std::move(fn)});
+    layout_dirty_ = true;
   }
 
   // `n_elements` single-cell elements along x, `spacing` cells apart, starting at `first`
@@ -416,6 +432,7 @@ public:
         create_source({cell}, array.element_fn(static_cast<double>(cell_offset)));
     }
     arrays.push_back(array);
+    layout_dirty_ = true;
     return array;
   }
 
@@ -423,6 +440,7 @@ public:
   std::size_t create_receiver(Cell cell) {
     receivers.push_back({cell, {}});
     cell_features[cell.y * width_ + cell.x] |= FEATURE_RX;
+    layout_dirty_ = true;
     return receivers.size() - 1;
   }
 
@@ -432,46 +450,59 @@ public:
 
   // mark cells as perfect electric conductor; waves reflect off them
   void add_metal(std::vector<Cell> const& cells) {
-    for (auto const& cell : cells) {
-      cell_features[cell.y * width_ + cell.x] |= FEATURE_METAL;
-      grid_.set_pec(cell.x, cell.y, true);
-    }
+    for (auto const& cell : cells) cell_features[cell.y * width_ + cell.x] |= FEATURE_METAL;
+    backend_->set_pec(cells, true);
   }
 
   void remove_metal(std::vector<Cell> const& cells) {
-    for (auto const& cell : cells) {
-      cell_features[cell.y * width_ + cell.x] &= static_cast<uint8_t>(~FEATURE_METAL);
-      grid_.set_pec(cell.x, cell.y, false);
-    }
+    for (auto const& cell : cells) cell_features[cell.y * width_ + cell.x] &= static_cast<uint8_t>(~FEATURE_METAL);
+    backend_->set_pec(cells, false);
   }
 
   std::vector<uint8_t> const& get_cell_features() const {
     return cell_features;
   }
 
-  std::vector<float> const& grid() const {
-    return grid_.get_ez();
+  FieldView field() const { return backend_->ez(); }
+
+  // the step the latest batch started at, and how many steps it ran
+  std::size_t batch_start() const { return step_ - batch_size_; }
+  std::size_t batch_size() const { return batch_size_; }
+
+  // ez at each element of `array` after step `step_in_batch` of the latest batch,
+  // in the order of that array's cells()
+  float const* array_samples(std::size_t array, std::size_t step_in_batch) const {
+    std::size_t row = step_in_batch * backend_->probe_count();
+    return probe_rows_.data() + row + array_probe_offsets_[array];
   }
 
-  void step() {
-    double now = time();
-    for (auto& source : sources) {
-      auto value = source.fn(now);
-      for (auto& cell : source.cells) {
-        grid_.add_source(cell.x, cell.y, value);
+  // runs n steps; every source is evaluated at each step's time before the backend sees the batch,
+  // so pulses fired between batches only take effect from the next batch on
+  void step(std::size_t n) {
+    if (layout_dirty_) rebuild_layout();
+    std::size_t n_sources = backend_->source_count();
+    std::size_t n_probes = backend_->probe_count();
+
+    source_values_.resize(n * n_sources);
+    for (std::size_t i = 0; i < n; ++i) {
+      double now = static_cast<double>(step_ + i) * dt_;
+      float* values = source_values_.data() + i * n_sources;
+      for (auto& source : sources) {
+        float value = source.fn(now);
+        for (std::size_t c = 0; c < source.cells.size(); ++c) *values++ = value;
       }
     }
-    grid_.update();
-    for (auto& receiver : receivers) {
-      receiver.samples.push_back(grid_.get_ez(receiver.cell.x, receiver.cell.y));
+
+    probe_rows_.resize(n * n_probes);
+    backend_->step(n, source_values_.data(), probe_rows_.data());
+    step_ += n;
+    batch_size_ = n;
+
+    for (std::size_t i = 0; i < n; ++i) {
+      float const* row = probe_rows_.data() + i * n_probes + receiver_probe_offset_;
+      for (std::size_t r = 0; r < receivers.size(); ++r) receivers[r].samples.push_back(row[r]);
     }
-    for (auto& array : arrays) {
-      auto const& cells = array.cells();
-      for (std::size_t i = 0; i < cells.size(); ++i)
-        array.record(step_, i, grid_.get_ez(cells[i].x, cells[i].y));
-      array.prune_pulses(time());
-    }
-    ++step_;
+    for (auto& array : arrays) array.prune_pulses(time());
   }
 
 };
@@ -1064,7 +1095,11 @@ void print_bar(float value, float max_value, int half_width) {
 }
 
 
-int main() {
+int main(int argc, char** argv) {
+  // the field runs on the GPU unless started with --cpu
+  bool use_cpu = argc > 1 && std::string(argv[1]) == "--cpu";
+  auto backend = use_cpu ? RadarSim::Backend::Cpu : RadarSim::Backend::Gpu;
+
   // λ = 20 cells at 1.5 GHz with 1 cm cells, so the grid is 50 x 35 wavelengths
   constexpr std::size_t grid_width = 1000;
   constexpr std::size_t grid_height = 700;
@@ -1073,8 +1108,8 @@ int main() {
   constexpr int window_width = 1400;
   constexpr int window_height = static_cast<int>(window_width * grid_height / grid_width);
   InitWindow(window_width, window_height, "radar sim");
-  SetTargetFPS(512);
-  constexpr int steps_per_frame = 15;
+  SetTargetFPS(60);
+  constexpr std::size_t steps_per_frame = 25;
   constexpr double cell_size = 0.01;   // 1 cm per cell
   constexpr std::size_t sample_ring_size = 128;
   constexpr std::size_t request_ring_size = 128;
@@ -1082,17 +1117,14 @@ int main() {
   constexpr std::size_t plot_ring_size = 32;
   constexpr std::size_t track_ring_size = 64;
 
-  auto radar_sim = RadarSim(grid_width, grid_height, border, cell_size);
-  auto const& ez_grid = radar_sim.grid();
-  // raylib only reads from image data, so the const_cast is safe
-  Image ez_img = {
-    const_cast<float*>(ez_grid.data()),
-    grid_width,
-    grid_height,
-    1,
-    PIXELFORMAT_UNCOMPRESSED_R32
-  };
-  Texture2D ez_tex = LoadTextureFromImage(ez_img);
+  auto radar_sim = RadarSim(grid_width, grid_height, border, backend, cell_size);
+  std::printf("field on the %s\n", use_cpu ? "CPU" : "GPU");
+  // a backend with ez on the CPU is uploaded into this buffer every frame
+  constexpr auto ez_bytes = static_cast<unsigned>(grid_width * grid_height * sizeof(float));
+  unsigned ez_upload_buffer = rlLoadShaderBuffer(ez_bytes, nullptr, RL_DYNAMIC_DRAW);
+  Image quad_img = GenImageColor(1, 1, WHITE);
+  Texture2D quad_tex = LoadTextureFromImage(quad_img);
+  UnloadImage(quad_img);
 
   // vertical array of 16 elements at λ/2 spacing, 2λ in from the sponge, facing +x
   constexpr std::size_t n_elements = 16;
@@ -1145,6 +1177,8 @@ int main() {
   int gain_loc = GetShaderLocation(shader, "gain");
   float gain = static_cast<float>(visual_gain);
   SetShaderValue(shader, gain_loc, &gain, SHADER_UNIFORM_FLOAT);
+  int grid_size[2] = {static_cast<int>(grid_width), static_cast<int>(grid_height)};
+  SetShaderValue(shader, GetShaderLocation(shader, "grid_size"), grid_size, SHADER_UNIFORM_IVEC2);
 
   Geometry geometry{
     cell_size,
@@ -1236,23 +1270,33 @@ int main() {
     }
 
     double start_time = GetTime();
-    for (int s = 0; s < steps_per_frame; ++s) {
-      radar_sim.step();
+    // requests take effect from the next batch on; the scheduler asks a whole PRI ahead,
+    // far more than a batch, so a pulse is never fired after its start
+    while (auto request = pulse_requests.pop()) {
+      array.fire(*request);
+    }
+    radar_sim.step(steps_per_frame);
+    for (std::size_t s = 0; s < radar_sim.batch_size(); ++s) {
       SampleBatch<n_elements> batch;
-      array.fill(batch);
+      batch.step = radar_sim.batch_start() + s;
+      std::copy_n(radar_sim.array_samples(0, s), n_elements, batch.samples.begin());
       // make sure that no batches are dropped and lost
       while(!sample_batches.push(batch)) {};
-      while (auto request = pulse_requests.pop()) {
-        array.fire(*request);
-      }
     }
     double work_time = GetTime() - start_time;
-    UpdateTexture(ez_tex, ez_grid.data());
+    // a GPU backend hands over its own buffer, a CPU backend's field is uploaded first
+    FieldView field = radar_sim.field();
+    unsigned ez_buffer = field.gl_buffer;
+    if (field.cpu) {
+      rlUpdateShaderBuffer(ez_upload_buffer, field.cpu, ez_bytes, 0);
+      ez_buffer = ez_upload_buffer;
+    }
     BeginDrawing();
     BeginShaderMode(shader);
     SetShaderValueTexture(shader, features_loc, features_tex);  // must be inside BeginShaderMode
-    DrawTexturePro(ez_tex,
-      {0, 0, static_cast<float>(grid_width), static_cast<float>(grid_height)},
+    rlBindShaderBuffer(ez_buffer, 0);  // binding 0 in the shader
+    DrawTexturePro(quad_tex,
+      {0, 0, 1, 1},
       {0, 0, static_cast<float>(GetScreenWidth()), static_cast<float>(GetScreenHeight())},
       {0, 0}, 0.0f, WHITE);
     EndShaderMode();
@@ -1296,7 +1340,8 @@ int main() {
   worker_thread.join();
   UnloadShader(shader);
   UnloadTexture(features_tex);
-  UnloadTexture(ez_tex);
+  UnloadTexture(quad_tex);
+  rlUnloadShaderBuffer(ez_upload_buffer);
   CloseWindow();
   std::printf("closed, samples recorded at dt = %g s\n", radar_sim.dt());
 }

@@ -14,6 +14,8 @@ add_executable(lgr_bench bench_logger.cpp)
 target_link_libraries(lgr_bench PRIVATE rt_core rt_warnings)
 
 include(FetchContent)
+# 4.3 is the first version with shader storage buffers and compute shaders
+set(OPENGL_VERSION "4.3" CACHE STRING "OpenGL version raylib is built for" FORCE)
 FetchContent_Declare(
   raylib
   GIT_REPOSITORY https://github.com/raysan5/raylib.git
@@ -21,5 +23,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(raylib)
 target_compile_options(raylib PRIVATE -w)
 
+# the GPU backend needs raylib's OpenGL context, so it lives apart from rt_core
+add_library(rt_gpu STATIC ${PROJECT_SOURCE_DIR}/src/gpu_backend.cpp)
+target_link_libraries(rt_gpu PUBLIC rt_core raylib PRIVATE rt_warnings)
+
 add_executable(radar_sim radar_sim.cpp)
-target_link_libraries(radar_sim PRIVATE rt_core rt_warnings raylib)
+target_link_libraries(radar_sim PRIVATE rt_core rt_gpu rt_warnings raylib)
+
+# checks the GPU backend against the CPU one and times both
+add_executable(backend_compare backend_compare.cpp)
+target_link_libraries(backend_compare PRIVATE rt_core rt_gpu rt_warnings raylib)

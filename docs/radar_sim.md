@@ -23,7 +23,7 @@ The queues between them:
 
 ## 2. The hardware side
 
-**Field simulation.** `FDTDGrid` steps the electric and magnetic fields cell by cell, which makes waves spread out, reflect off metal and get absorbed by the sponge border. Metal works by forcing the electric field to zero in its cells. Dragging a target used to make the field "explode", because metal only *stopped updating* the field instead of zeroing it. A field frozen at a nonzero value inside the metal acted like a permanent battery that pumped energy into the surroundings every step. `set_pec` now zeroes the field when a cell becomes metal.
+**Field simulation.** A backend behind the `FdtdBackend` interface (`GpuBackend` with OpenGL compute shaders by default, `CpuBackend` with `--cpu`; `backend_compare` checks that they agree) steps the electric and magnetic fields cell by cell, in batches of steps, which makes waves spread out, reflect off metal and get absorbed by the sponge border. Metal works by forcing the electric field to zero in its cells. Dragging a target used to make the field "explode", because metal only *stopped updating* the field instead of zeroing it. A field frozen at a nonzero value inside the metal acted like a permanent battery that pumped energy into the surroundings every step. `set_pec` now zeroes the field when a cell becomes metal.
 
 **The phased array.** It's a row of 16 elements, each a single cell that both transmits and receives, with a ground plane behind it so it radiates forward.
 
