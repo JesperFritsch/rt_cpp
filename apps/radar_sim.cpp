@@ -1,6 +1,7 @@
 #include <rt/cpu_backend.hpp>
 #include <rt/gpu_backend.hpp>
 #include <rt/ring_buffer_spsc.hpp>
+#include <rt/terminal_plot.hpp>
 #include <array>
 #include <cassert>
 #include <cstdio>
@@ -167,6 +168,8 @@ struct RadarConfig {
                                                // Track pulse; 2 alternates, 0 turns track pulses off
   bool simultaneous_tracks = true;             // fire a Track pulse together with every Search pulse instead,
                                                // so tracking does not slow the scan; track_interval is unused
+  bool plot_db = true;                         // terminal plots in dB relative to their peak instead of linear
+  double plot_db_range = 60.0;                 // dB below the peak the plots reach down to
 
   // derived
   double blind_range() const        { return speed_of_light * pulse_duration / 2.0; }
@@ -740,7 +743,9 @@ public:
     auto reference_len = static_cast<std::size_t>(std::ceil(config_.pulse_duration / dt_));
     reference_.reserve(reference_len);
     reference_quadrature_.reserve(reference_len);
-    envelope_.resize(pri_steps_);
+    compressed_.resize(pri_steps_);
+    plot_envelope_.resize(pri_steps_);
+    plot_received_.resize(pri_steps_);
     detections_.reserve(16);
     peak_lags_.reserve(16);
     angle_response_.reserve(128);
@@ -914,16 +919,16 @@ private:
     double crossing_time = geometry_.array_length / speed_of_light;
     auto blind_rows = static_cast<std::size_t>(std::ceil((config_.pulse_duration + window_steer_time + crossing_time) / dt_)) + max_shift;
 
-    std::size_t last_lag = pri_steps_ - reference_.size();
-    if (blind_rows > last_lag) return;
-    double envelope_sum = 0.0;
-    float envelope_max = 0.0f;
-    for (std::size_t lag = blind_rows; lag <= last_lag; ++lag) {
-      envelope_[lag] = matched_filter(lag);
-      envelope_sum += static_cast<double>(envelope_[lag]);
-      envelope_max = std::max(envelope_max, envelope_[lag]);
+    std::size_t final_lag = pri_steps_ - reference_.size();
+    if (blind_rows > final_lag) return;
+    double compressed_sum = 0.0;
+    float compressed_max = 0.0f;
+    for (std::size_t lag = blind_rows; lag <= final_lag; ++lag) {
+      compressed_[lag] = matched_filter(lag);
+      compressed_sum += static_cast<double>(compressed_[lag]);
+      compressed_max = std::max(compressed_max, compressed_[lag]);
     }
-    double mean = envelope_sum / static_cast<double>(last_lag - blind_rows + 1);
+    double mean = compressed_sum / static_cast<double>(final_lag - blind_rows + 1);
     auto threshold = static_cast<float>(config_.detection_factor * mean);
 
     // each run of lags above the threshold is one echo, detected at its strongest lag
@@ -931,10 +936,10 @@ private:
     peak_lags_.clear();
     std::size_t peak_lag = 0;
     float peak = 0.0f;
-    for (std::size_t lag = blind_rows; lag <= last_lag + 1; ++lag) {
-      bool above = lag <= last_lag && envelope_[lag] > threshold;
-      if (above && envelope_[lag] > peak) {
-        peak = envelope_[lag];
+    for (std::size_t lag = blind_rows; lag <= final_lag + 1; ++lag) {
+      bool above = lag <= final_lag && compressed_[lag] > threshold;
+      if (above && compressed_[lag] > peak) {
+        peak = compressed_[lag];
         peak_lag = lag;
       }
       if (!above && peak > 0.0f) {
@@ -947,6 +952,9 @@ private:
         peak = 0.0f;
       }
     }
+    // before estimate_theta, which overwrites parts of beam_; one search pulse per PRI, so one plot per PRI
+    if (search) draw_plots(pulse, blind_rows, final_lag, threshold, mean, tx_offset_rows);
+
     // after the search above, since estimate_theta overwrites parts of beam_
     for (std::size_t i = 0; i < detections_.size(); ++i)
       detections_[i].theta = estimate_theta(pulse.theta, peak_lags_[i]);
@@ -957,7 +965,7 @@ private:
       std::printf("pulse at step %zu, theta %+6.1f deg, track #%zu:", fire_step(pulse), pulse.theta * 180.0 / pi,
                   pulse.track_id);
     // with nothing detected, the strongest response shows how far below the threshold it is
-    if (detections_.empty()) std::printf(" -  (max x%.1f)", static_cast<double>(envelope_max) / mean);
+    if (detections_.empty()) std::printf(" -  (max x%.1f)", static_cast<double>(compressed_max) / mean);
     for (auto const& detection : detections_)
       std::printf("  %.2f m at %+.1f deg (x%.1f)", detection.range, detection.theta * 180.0 / pi,
                   static_cast<double>(detection.strength));
@@ -974,6 +982,90 @@ private:
       scheduler_.set_tracks(tracker_.tracks());
       send_tracks();
     }
+  }
+
+  // amplitude `value` in dB relative to `reference`, no lower than -config_.plot_db_range
+  float to_db(float value, float reference) const {
+    double floor = std::pow(10.0, -config_.plot_db_range / 20.0);
+    double ratio = std::max(static_cast<double>(std::abs(value)) / static_cast<double>(reference), floor);
+    return static_cast<float>(20.0 * std::log10(ratio));
+  }
+
+  // redraws the top of the terminal over the whole window: the middle element's raw samples, then
+  // the pulse-compressed envelope with the threshold dotted, a ^ under each detection and a | where
+  // the blind zone ends
+  // both are scaled to their peak after the blind zone, so our own transmission at the start is
+  // clipped instead of squeezing every echo flat; config_.plot_db shows them in dB instead
+  void draw_plots(PulseRequest const& pulse, std::size_t blind_rows, std::size_t final_lag,
+                  float threshold, double mean, double tx_offset_rows) {
+    std::size_t cols = dashboard_.width();
+    if (cols < 20) return;
+    bool db = config_.plot_db;
+    auto db_range = static_cast<float>(config_.plot_db_range);
+
+    std::vector<std::string> lines;
+    lines.reserve(plot_lines);
+    // a title wider than the terminal would wrap into the plot below it
+    auto title = [&](std::string text) { return text.substr(0, cols); };
+
+    // one element, not the beam, so echoes from every direction show; window_ is time-major
+    constexpr std::size_t element = N_ELEMENTS / 2;
+    float peak_received = 0.0f;
+    for (std::size_t row = 0; row < pri_steps_; ++row) {
+      plot_received_[row] = window_[row * N_ELEMENTS + element];
+      if (row >= blind_rows) peak_received = std::max(peak_received, std::abs(plot_received_[row]));
+    }
+    if (peak_received == 0.0f) peak_received = 1.0f;
+    BrailleCanvas received(cols, plot_height);
+    if (db) {
+      for (float& value : plot_received_) value = to_db(value, peak_received);
+      plot_series(received, plot_received_.data(), plot_received_.size(), -db_range, 0.0f);
+    } else {
+      plot_series(received, plot_received_.data(), plot_received_.size(), -peak_received, peak_received);
+    }
+    lines.push_back(title(format_text("received at element %zu, pulse at step %zu toward %+.1f deg, %s %.3g after the blind zone",
+                                element, fire_step(pulse), pulse.theta * 180.0 / pi,
+                                db ? "0 dB =" : "scaled to", static_cast<double>(peak_received))));
+    for (std::size_t r = 0; r < received.rows(); ++r) lines.push_back(received.row(r));
+
+    // the envelope is only computed between the blind rows and the last lag, zero elsewhere
+    std::fill(plot_envelope_.begin(), plot_envelope_.end(), 0.0f);
+    std::copy(compressed_.begin() + static_cast<std::ptrdiff_t>(blind_rows),
+              compressed_.begin() + static_cast<std::ptrdiff_t>(final_lag + 1),
+              plot_envelope_.begin() + static_cast<std::ptrdiff_t>(blind_rows));
+    float peak_envelope = *std::max_element(plot_envelope_.begin(), plot_envelope_.end());
+    if (peak_envelope == 0.0f) peak_envelope = 1.0f;
+    BrailleCanvas compressed(cols, plot_height);
+    if (db) {
+      for (float& value : plot_envelope_) value = to_db(value, peak_envelope);
+      float threshold_db = to_db(threshold, peak_envelope);
+      float top = std::max(0.0f, threshold_db) + 3.0f;
+      plot_series(compressed, plot_envelope_.data(), plot_envelope_.size(), -db_range, top);
+      plot_level(compressed, threshold_db, -db_range, top);
+    } else {
+      float top = 1.1f * std::max(peak_envelope, threshold);
+      plot_series(compressed, plot_envelope_.data(), plot_envelope_.size(), 0.0f, top);
+      plot_level(compressed, threshold, 0.0f, top);
+    }
+    lines.push_back(title(format_text("pulse compressed (beam toward %+.1f deg), threshold x%.1f dotted, peak x%.1f%s, %zu detections",
+                                pulse.theta * 180.0 / pi, config_.detection_factor,
+                                static_cast<double>(peak_envelope) / mean, db ? " = 0 dB" : "", detections_.size())));
+    for (std::size_t r = 0; r < compressed.rows(); ++r) lines.push_back(compressed.row(r));
+
+    // range axis: the range at each end of the window, | where the blind zone ends, ^ under each detection
+    auto range_at = [&](double lag) { return speed_of_light * (lag - tx_offset_rows) * dt_ / 2.0; };
+    std::string axis(cols, ' ');
+    axis[std::min(cols - 1, blind_rows * cols / pri_steps_)] = '|';
+    for (std::size_t lag : peak_lags_) axis[std::min(cols - 1, lag * cols / pri_steps_)] = '^';
+    std::string left = format_text("%.1f m", range_at(0.0));
+    std::string right = format_text("%.1f m", range_at(static_cast<double>(pri_steps_ - 1)));
+    if (left.size() + right.size() + 2 < cols) {
+      axis.replace(0, left.size(), left);
+      axis.replace(cols - right.size(), right.size(), right);
+    }
+    lines.push_back(axis);
+
+    dashboard_.draw(lines);
   }
 
   // sends every track to the sim under a new report number, so it replaces the previous set
@@ -1063,7 +1155,12 @@ private:
   Waveform reference_wave_{};            // the waveform reference_ was built from
   std::vector<float> reference_;         // transmitted pulse, one sample per step
   std::vector<float> reference_quadrature_;  // reference_ with the carrier shifted 90 degrees
-  std::vector<float> envelope_;          // matched filter magnitude per lag, pri_steps long
+  std::vector<float> compressed_;          // matched filter magnitude per lag, pri_steps long
+  static constexpr std::size_t plot_height = 10;                  // lines per plot
+  static constexpr std::size_t plot_lines = 2 * (1 + plot_height) + 1;  // two titled plots and the range axis
+  TerminalDashboard dashboard_{plot_lines};
+  std::vector<float> plot_envelope_;     // envelope_ with the lags it was not computed for zeroed, pri_steps long
+  std::vector<float> plot_received_;     // one element's samples from window_, pri_steps long
   std::vector<Detection> detections_;    // from the latest window
   std::vector<std::size_t> peak_lags_;   // envelope lag of each detection, same order
   std::vector<float> angle_response_;    // estimate_theta's matched filter output per trial angle
