@@ -58,6 +58,18 @@ find_package(OpenMP REQUIRED)
 target_link_libraries(rt_core PRIVATE OpenMP::OpenMP_CXX)
 
 # --------------------------------------------------------------------------
+# rt_radar - the radar sim and processing, without any window or OpenGL;
+# headers in include/rt/radar, RadarProcessor is header-only (a template)
+# --------------------------------------------------------------------------
+add_library(rt_radar STATIC
+  src/radar/waveform.cpp
+  src/radar/sim.cpp
+  src/radar/scheduler.cpp
+  src/radar/tracker.cpp)
+target_link_libraries(rt_radar PUBLIC rt_core PRIVATE rt_warnings)
+target_compile_options(rt_radar PRIVATE $<$<CONFIG:Release>:-march=native>)
+
+# --------------------------------------------------------------------------
 if(RT_BUILD_APPS)
     add_subdirectory(apps)
 endif()

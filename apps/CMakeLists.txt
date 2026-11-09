@@ -28,7 +28,7 @@ add_library(rt_gpu STATIC ${PROJECT_SOURCE_DIR}/src/gpu_backend.cpp)
 target_link_libraries(rt_gpu PUBLIC rt_core raylib PRIVATE rt_warnings)
 
 add_executable(radar_sim radar_sim.cpp)
-target_link_libraries(radar_sim PRIVATE rt_core rt_gpu rt_warnings raylib)
+target_link_libraries(radar_sim PRIVATE rt_radar rt_gpu rt_warnings raylib)
 
 # checks the GPU backend against the CPU one and times both
 add_executable(backend_compare backend_compare.cpp)
